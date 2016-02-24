@@ -4,9 +4,8 @@ package std
 import cats.syntax.all._
 import cats.data.Xor
 
-import scala.util.control.NonFatal
-import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration.FiniteDuration
+import scala.util.{Success, Try}
+import scala.concurrent.{Promise, ExecutionContext, Future}
 
 trait FutureInstances extends FutureInstances1 {
 
@@ -16,21 +15,45 @@ trait FutureInstances extends FutureInstances1 {
 
       override def pureEval[A](x: Eval[A]): Future[A] = Future(x.value)
 
-      def flatMap[A, B](fa: Future[A])(f: A => Future[B]): Future[B] = fa.flatMap(f)
+      def flatMap[A, B](fa: Future[A])(f: A => Future[B]): Future[B] = flatMapTry(fa)(_ map f)
 
-      def handleErrorWith[A](fea: Future[A])(f: Throwable => Future[A]): Future[A] = fea.recoverWith { case t => f(t) }
+      def handleErrorWith[A](fea: Future[A])(f: Throwable => Future[A]): Future[A] = recoverWith(fea) { case x => f(x) }
 
       def raiseError[A](e: Throwable): Future[A] = Future.failed(e)
-      override def handleError[A](fea: Future[A])(f: Throwable => A): Future[A] = fea.recover { case t => f(t) }
+
+      override def handleError[A](fea: Future[A])(f: Throwable => A): Future[A] = recover(fea) { case x => f(x) }
 
       override def attempt[A](fa: Future[A]): Future[Throwable Xor A] =
-        (fa map Xor.right) recover { case NonFatal(t) => Xor.left(t) }
+        recover(map(fa)(Xor.right[Throwable, A](_))) { case x => Xor.left(x) }
 
-      override def recover[A](fa: Future[A])(pf: PartialFunction[Throwable, A]): Future[A] = fa.recover(pf)
+      override def recover[A](fa: Future[A])(pf: PartialFunction[Throwable, A]): Future[A] =
+        mapTry(fa)(_ recover pf)
 
-      override def recoverWith[A](fa: Future[A])(pf: PartialFunction[Throwable, Future[A]]): Future[A] = fa.recoverWith(pf)
+      override def recoverWith[A](fa: Future[A])(pf: PartialFunction[Throwable, Future[A]]): Future[A] =
+        flatMapTry[A, A](fa)(t => if (t.isFailure) t.failed.map(pf.lift(_).getOrElse(fa)) else t.map(_ => fa))
 
-      override def map[A, B](fa: Future[A])(f: A => B): Future[B] = fa.map(f)
+      override def map[A, B](fa: Future[A])(f: A => B): Future[B] = mapTry(fa)(_ map f)
+
+      private def mapTry[A, B](fa: Future[A])(f: Try[A] => Try[B]): Future[B] =
+        if (fa.isCompleted && fa.value.isDefined) Future.fromTry(Try(f(fa.value.get)).flatten)
+        else {
+          val p = Promise[B]
+          fa.onComplete(t => p.complete(Try(f(t)).flatten))
+          p.future
+        }
+
+      private def flatMapTry[A, B](fa: Future[A])(f: Try[A] => Try[Future[B]]): Future[B] = {
+        val p = Promise[B]
+        mapTry(fa) { case t =>
+          Try(f(t)).flatten
+            .map { res =>
+              if (res.isCompleted && res.value.isDefined) p.complete(res.value.get)
+              else p.completeWith(res)
+            }
+            .recover { case e => p.failure(e) }
+        }
+        p.future
+      }
     }
 
   implicit def futureGroup[A: Group](implicit ec: ExecutionContext): Group[Future[A]] =
